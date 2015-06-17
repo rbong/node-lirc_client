@@ -1,6 +1,7 @@
 #include <lirc/lirc_client.h>
 
 #include <inttypes.h>
+#include <node/uv.h>
 #include <stdlib.h>
 #include <string.h>
 #include <string>
@@ -40,7 +41,7 @@ static bool closed = true;
 static Persistent<Array> configFiles_;
 
 
-char *string2char(const Handle<String> avalue) {
+char *string2char(const Local<String> avalue) {
 
 	v8::String::Utf8Value utf8_value(avalue);
 
@@ -58,36 +59,38 @@ void addConfig(Handle<Array> name);
 void connect(Handle<String> programname, Handle<Boolean> verbose, Handle<Array> configfiles, Handle<Function> cb);
 
 void connect(Handle<String> programname, Handle<Boolean> verbose, Handle<String> configfiles, Handle<Function> cb) {
-	Local<Array> tmpArray = Array::New(1);
-	tmpArray->Set(Number::New(0), configfiles);
+	Isolate* isolate = Isolate::GetCurrent();
+	Local<Array> tmpArray = Array::New(isolate, 1);
+	tmpArray->Set(Number::New(isolate, 0), configfiles);
 	connect(programname, verbose, tmpArray, cb);
 }
 
 void connect(Handle<String> programname, Handle<Boolean> verbose, Handle<Array> configfiles, Handle<Function> cb) {
+	Isolate* isolate = Isolate::GetCurrent();
 
 	if (!closed) return;
 
 	closed = true;
 
-	gProgramName = Persistent<String>::New( programname );
-	gVerbose = Persistent<Boolean>::New( verbose );
+	gProgramName.Reset ( isolate, programname );
+	gVerbose.Reset ( isolate, verbose );
 
 	for (int i=0; i < MAX_CONFIGS; i++) {
 		my_lirc_config[i].lirc_config_ = NULL;
 	}
 
 	if (lircd_fd == -1) {
-		char * writable = string2char(gProgramName);
+		char * writable = string2char(Local<String>::New(isolate, gProgramName));
 		lircd_fd = lirc_init(writable, verbose->Value() == true ? 1 : 0);
 		delete[] writable;
 	}
-	
+
 	if (lircd_fd < 0) {
-		ThrowException(Exception::Error(String::New("Error on lirc_init.")));
+		isolate->ThrowException(Exception::Error(String::NewFromUtf8(isolate, "Error on lirc_init.")));
 		return;
 	}
 
-	configFiles_ = Persistent<Array>::New( Array::New() );
+	configFiles_.Reset ( isolate, Array::New(isolate) );
 	addConfig(configfiles);
 
 	if (read_watcher_ == NULL) {
@@ -99,7 +102,7 @@ void connect(Handle<String> programname, Handle<Boolean> verbose, Handle<Array> 
 		uv_poll_start(read_watcher_, UV_READABLE, io_event);
 	}
 
-	global_cb = Persistent<Function>::New(cb);
+	global_cb.Reset (isolate, cb);
 
 	closed = false;
 
@@ -131,6 +134,7 @@ void close() {
 }
 
 void addConfig(Local<String> name) {
+	Isolate* isolate = Isolate::GetCurrent();
 
 	int i = 0;
 	while ((i < MAX_CONFIGS) && (my_lirc_config[i].lirc_config_ != NULL)) {
@@ -140,33 +144,35 @@ void addConfig(Local<String> name) {
 	if (i < MAX_CONFIGS) {
 		char * writable = NULL;
 		if (name->Length() > 0) {
-			writable = string2char(name);
+			writable = string2char(Local<String>::New (isolate, name));
 		}
 
 		if (lirc_readconfig(writable, &(my_lirc_config[i].lirc_config_), NULL) != 0) {
-			ThrowException(Exception::Error(String::Concat(String::New("Error on lirc_readconfig for file:"),name)));
+			isolate->ThrowException(Exception::Error(String::Concat(String::NewFromUtf8(isolate, "Error on lirc_readconfig for file:"),name)));
 			delete[] writable;
 			return;
 		}
-	
+
 		delete[] writable;
 
-		uint32_t oldLength = configFiles_->Length();
+		Local<Array> localConfigFiles_ = Local<Array>::New(isolate, configFiles_);
+		uint32_t oldLength = localConfigFiles_->Length ();
 
-		configFiles_->Set(String::New("length"), Number::New(oldLength+1));
-		configFiles_->Set(Number::New(oldLength), name);
+		localConfigFiles_->Set(String::NewFromUtf8(isolate, "length"), Number::New(isolate, oldLength+1));
+		localConfigFiles_->Set(Number::New(isolate, oldLength), name);
 	}
 	else {
-		ThrowException(Exception::Error(String::New("Config buffer is full.")));
+		isolate->ThrowException(Exception::Error(String::NewFromUtf8(isolate, "Config buffer is full.")));
 	}
 }
 
 void addConfig(Handle<Array> names) {
+	Isolate* isolate = Isolate::GetCurrent();
 
 	int length = names->Length();
 	for(int i = 0; i < length; i++) {
 		if (!names->Get(i)->IsString()) {
-			ThrowException(Exception::Error(String::Concat(String::New("Array element is not a String:"),names->Get(i)->ToString())));
+			isolate->ThrowException(Exception::Error(String::Concat(String::NewFromUtf8(isolate, "Array element is not a String:"),names->Get(i)->ToString())));
 			return;
 		}
 		Local<Value> configfile = names->Get(i);
@@ -175,8 +181,10 @@ void addConfig(Handle<Array> names) {
 }
 
 void clearConfig() {
+	Isolate* isolate = Isolate::GetCurrent();
 
-	configFiles_->Set(String::New("length"), Number::New(0));
+	Local<Array> localConfigFiles_ = Local<Array>::New(isolate, configFiles_);
+	localConfigFiles_->Set(String::NewFromUtf8(isolate, "length"), Number::New(isolate, 0));
 
 	for (int i=0; i < MAX_CONFIGS; i++) {
 		if (my_lirc_config[i].lirc_config_ != NULL) {
@@ -187,15 +195,18 @@ void clearConfig() {
 }
 
 
-static Handle<Value> Connect (const Arguments& args) {
-	HandleScope scope;
+static void Connect (const FunctionCallbackInfo<Value>& args) {
+	Isolate* isolate = Isolate::GetCurrent();
+	EscapableHandleScope scope(isolate);
 
 	if (!closed) {
-		return Undefined();
+		args.GetReturnValue().Set(Undefined(isolate));
+		return;
 	}
 
 	if (args.Length() > 4) {
-		return ThrowException(Exception::TypeError(String::New("Only four arguments are allowed.")));
+		isolate->ThrowException(Exception::TypeError(String::NewFromUtf8(isolate, "Only four arguments are allowed.")));
+		return;
 	}
 
 	int prognameindex = -1;
@@ -206,7 +217,8 @@ static Handle<Value> Connect (const Arguments& args) {
 	for(int i=0; i < args.Length(); i++) {
 		if (args[i]->IsString()) {
 			if ((prognameindex != -1) && (configindex != -1)) {
-				return ThrowException(Exception::TypeError(String::New("Only two String argument are allowed (Program name and Config files).")));
+				isolate->ThrowException(Exception::TypeError(String::NewFromUtf8(isolate, "Only two String argument are allowed (Program name and Config files).")));
+				return;
 			}
 			if (prognameindex == -1) {
 				prognameindex = i;
@@ -217,87 +229,107 @@ static Handle<Value> Connect (const Arguments& args) {
 		}
 		else if (args[i]->IsBoolean()) {
 			if (verboseindex != -1) {
-				return ThrowException(Exception::TypeError(String::New("Only one boolean argument is allowed (verbose).")));
+				isolate->ThrowException(Exception::TypeError(String::NewFromUtf8(isolate, "Only one boolean argument is allowed (verbose).")));
+				return;
 			}
 			verboseindex = i;
 		}
 		else if (args[i]->IsFunction()) {
 			if (cbindex != -1) {
-				return ThrowException(Exception::TypeError(String::New("Only one Callback Function argument is allowed (cb).")));
+				isolate->ThrowException(Exception::TypeError(String::NewFromUtf8(isolate, "Only one Callback Function argument is allowed (cb).")));
+				return;
 			}
 			cbindex = i;
 		}
 		else if (args[i]->IsArray()) {
 			if (configindex != -1) {
-				return ThrowException(Exception::TypeError(String::New("Only one Array argument is allowed (Config files).")));
+				isolate->ThrowException(Exception::TypeError(String::NewFromUtf8(isolate, "Only one Array argument is allowed (Config files).")));
+				return;
 			}
 			configindex = i;
 		}
 	}
 
 	if (prognameindex == -1) {
-		return ThrowException(Exception::Error(String::New("Programname is required.")));
+		isolate->ThrowException(Exception::Error(String::NewFromUtf8(isolate, "Programname is required.")));
+		return;
 	}
 
 	if (cbindex == -1) {
-		return ThrowException(Exception::Error(String::New("Callback function is required.")));
+		isolate->ThrowException(Exception::Error(String::NewFromUtf8(isolate, "Callback function is required.")));
+		return;
 	}
 
 	if ((configindex > -1) && (configindex < verboseindex)) {
-		return ThrowException(Exception::TypeError(String::New("Order of arguments is wrong. verbose must be before config files.")));
+		isolate->ThrowException(Exception::TypeError(String::NewFromUtf8(isolate, "Order of arguments is wrong. verbose must be before config files.")));
+		return;
 	}
 
 	if ((configindex > -1) && (configindex < prognameindex)) {
-		return ThrowException(Exception::TypeError(String::New("Order of arguments is wrong. program name must be before config files.")));
+		isolate->ThrowException(Exception::TypeError(String::NewFromUtf8(isolate, "Order of arguments is wrong. program name must be before config files.")));
+		return;
 	}
 
 	if ((verboseindex > -1) && (verboseindex < prognameindex)) {
-		return ThrowException(Exception::TypeError(String::New("Order of arguments is wrong. program name must be before verbose.")));
+		isolate->ThrowException(Exception::TypeError(String::NewFromUtf8(isolate, "Order of arguments is wrong. program name must be before verbose.")));
+		return;
 	}
 
 	if (configindex == -1) {
-		connect( args[prognameindex]->ToString(), verboseindex > -1 ? args[verboseindex]->ToBoolean() : Boolean::New(false), String::New(""), Local<Function>::Cast(args[cbindex]));
+		connect( args[prognameindex]->ToString(), verboseindex > -1 ? args[verboseindex]->ToBoolean() : Boolean::New(isolate, false), String::NewFromUtf8(isolate, ""), Local<Function>::Cast(args[cbindex]));
 	}
 	else if (args[configindex]->IsArray()) {
-		connect( args[prognameindex]->ToString(), verboseindex > -1 ? args[verboseindex]->ToBoolean() : Boolean::New(false), Local<Array>::Cast(args[configindex]), Local<Function>::Cast(args[cbindex]));
+		connect( args[prognameindex]->ToString(), verboseindex > -1 ? args[verboseindex]->ToBoolean() : Boolean::New(isolate, false), Local<Array>::Cast(args[configindex]), Local<Function>::Cast(args[cbindex]));
 	}
 	else if (args[configindex]->IsString()) {
-		connect( args[prognameindex]->ToString(), verboseindex > -1 ? args[verboseindex]->ToBoolean() : Boolean::New(false), args[configindex]->ToString(), Local<Function>::Cast(args[cbindex]));
+		connect( args[prognameindex]->ToString(), verboseindex > -1 ? args[verboseindex]->ToBoolean() : Boolean::New(isolate, false), args[configindex]->ToString(), Local<Function>::Cast(args[cbindex]));
 	}
 
-	return Undefined();
+	args.GetReturnValue().Set(Undefined (isolate));
+	return;
 }
 
-static Handle<Value> ReConnect (const Arguments& args) {
-	HandleScope scope;
+static void ReConnect (const FunctionCallbackInfo<Value>& args) {
+	Isolate* isolate = Isolate::GetCurrent();
+	EscapableHandleScope scope(isolate);
 
 	if (!closed) {
-		return Undefined();
+		args.GetReturnValue().Set(Undefined (isolate));
+		return;
 	}
 
-	int length = configFiles_->Length();
-	Local<Array> tmpArray = Array::New(length);
+	Local<Array> localConfigFiles_ = Local<Array>::New(isolate, configFiles_);
+	int length = localConfigFiles_->Length();
+	Local<Array> tmpArray = Array::New(isolate, length);
 	for (int i = 0; i < length; i++) {
-		tmpArray->Set(Number::New(i), configFiles_->Get(i));
+		tmpArray->Set(Number::New(isolate, i), localConfigFiles_->Get(i));
 	}
-	connect(gProgramName, gVerbose, tmpArray, global_cb);
+	Local<String> localProgramName = Local<String>::New (isolate, gProgramName);
+	Local<Boolean> localVerbose = Local<Boolean>::New (isolate, gVerbose);
+	Local<Function> local_cb = Local<Function>::New (isolate, global_cb);
+	connect(localProgramName, localVerbose, tmpArray, local_cb);
 
-	return Undefined();
+	args.GetReturnValue().Set(Undefined (isolate));
+	return;
 }
 
-static Handle<Value> Close (const Arguments& args) {
-      HandleScope scope;
+static void Close (const FunctionCallbackInfo<Value>& args) {
+	Isolate* isolate = Isolate::GetCurrent();
+	EscapableHandleScope scope(isolate);
 
-      close();
+	close();
 
-      return Undefined();
+	args.GetReturnValue().Set(Undefined (isolate));
+	return;
 }
 
-static Handle<Value> AddConfig (const Arguments& args) {
-	HandleScope scope;
+static void AddConfig (const FunctionCallbackInfo<Value>& args) {
+	Isolate* isolate = Isolate::GetCurrent();
+	EscapableHandleScope scope(isolate);
 
 	if (args.Length() != 1) {
-		return ThrowException(Exception::TypeError(String::New("Only one Array or String argument is allowed.")));
+		isolate->ThrowException(Exception::TypeError(String::NewFromUtf8(isolate, "Only one Array or String argument is allowed.")));
+		return;
 	}
 
 	if (args[0]->IsArray()) {
@@ -307,34 +339,41 @@ static Handle<Value> AddConfig (const Arguments& args) {
 		addConfig(args[0]->ToString());
 	}
 	else {
-		return ThrowException(Exception::TypeError(String::New("Only an Array or a String argument is allowed.")));
+		isolate->ThrowException(Exception::TypeError(String::NewFromUtf8(isolate, "Only an Array or a String argument is allowed.")));
+		return;
 	}
 
-	return Undefined();
+	args.GetReturnValue().Set(Undefined (isolate));
+	return;
 }
 
-static Handle<Value> ClearConfig (const Arguments& args) {
-	HandleScope scope;
+static void ClearConfig (const FunctionCallbackInfo<Value>& args) {
+	Isolate* isolate = Isolate::GetCurrent();
+	EscapableHandleScope scope(isolate);
 
 	clearConfig();
 
-	return Undefined();
+	args.GetReturnValue().Set(Undefined (isolate));
+	return;
 }
 
-static Handle<Value> IsConnectedGetter (Local<String> property,
-                                            const AccessorInfo& info) {
+static void IsConnectedGetter (Local<String> property, const PropertyCallbackInfo<Value>& info) {
 	assert(property == isConnected_symbol);
 
-	HandleScope scope;
+	Isolate* isolate = Isolate::GetCurrent();
+	EscapableHandleScope scope(isolate);
 
-	return scope.Close(Boolean::New(!closed));
+	Local<Boolean> localBool = Boolean::New (isolate, !closed);
+
+	info.GetReturnValue().Set(localBool);
+	return;
 }
 
-static Handle<Value> ModeGetter (Local<String> property,
-                                            const AccessorInfo& info) {
+static void ModeGetter (Local<String> property, const PropertyCallbackInfo<Value>& info) {
 	assert(property == mode_symbol);
 
-	HandleScope scope;
+	Isolate* isolate = Isolate::GetCurrent();
+	EscapableHandleScope scope(isolate);
 
 	const char *mode_ = NULL;
 	if (my_lirc_config[0].lirc_config_ != NULL) {
@@ -342,47 +381,54 @@ static Handle<Value> ModeGetter (Local<String> property,
 	}
 
 	if (mode_ == NULL) {
-		return Undefined();
+		info.GetReturnValue().Set(Undefined (isolate));
+		return;
 	}
 	else {
-		return scope.Close(String::New(mode_, strlen(mode_)));
+		info.GetReturnValue().Set(String::NewFromUtf8(isolate, mode_, String::kNormalString, strlen(mode_)));
+		return;
 	}
 }
 
-static void ModeSetter (Local<String> property, Local<Value> value,
-                                            const AccessorInfo& info) {
+static void ModeSetter (Local<String> property, Local<Value> value, const PropertyCallbackInfo<void>& info) {
 	assert(property == mode_symbol);
 
-	HandleScope scope;
+	Isolate* isolate = Isolate::GetCurrent();
+	EscapableHandleScope scope(isolate);
 
 	if (!value->IsString()) {
-		ThrowException(Exception::TypeError(String::New("Mode should be a string value")));
+		isolate->ThrowException(Exception::TypeError(String::NewFromUtf8(isolate, "Mode should be a string value")));
 		return;
 	}
 
-	char * writable = string2char(value->ToString());
+	char * writable = string2char(Local<String>::Cast(value));
 
 	if (my_lirc_config[0].lirc_config_ != NULL) {
 		lirc_setmode(my_lirc_config[0].lirc_config_, writable);
 	}
 	else {
-		ThrowException(Exception::TypeError(String::New("Cannot set mode on empty config")));
+		isolate->ThrowException(Exception::TypeError(String::NewFromUtf8(isolate, "Cannot set mode on empty config")));
 	}
 	delete[] writable;
 }
 
-static Handle<Value> ConfigFilesGetter (Local<String> property,
-                                            const AccessorInfo& info) {
+static void ConfigFilesGetter (Local<String> property, const PropertyCallbackInfo<Value>& info) {
 	assert(property == configFiles_symbol);
 
-	HandleScope scope;
+	Isolate* isolate = Isolate::GetCurrent();
+	EscapableHandleScope scope(isolate);
 
-	return scope.Close(configFiles_);
+	Local<Array> localConfigFiles_ = Local<Array>::New (isolate, configFiles_);
+
+	info.GetReturnValue().Set(localConfigFiles_);
+	return;
 }
 
-
 static void io_event (uv_poll_t* req, int status, int revents) {
-	HandleScope scope;
+	Isolate* isolate = Isolate::GetCurrent();
+	EscapableHandleScope scope(isolate);
+
+	Local<Function> local_cb = Local<Function>::New (isolate, global_cb);
 
 	if (status < 0)
 		return;
@@ -398,11 +444,11 @@ static void io_event (uv_poll_t* req, int status, int revents) {
 
 				// Send rawdata event
 				Handle<Value> emit_argv[2] = {
-					rawdata_symbol,
-					String::New(code, strlen(code))
+					Local<String>::New (isolate, rawdata_symbol),
+					String::NewFromUtf8(isolate, code, String::kNormalString, strlen(code))
 				};
 				TryCatch try_catch;
-				global_cb->Call(Context::GetCurrent()->Global(), 2, emit_argv);
+				local_cb->Call(isolate->GetCurrentContext()->Global(), 2, emit_argv);
 				if (try_catch.HasCaught())
 					FatalException(try_catch);
 
@@ -411,12 +457,12 @@ static void io_event (uv_poll_t* req, int status, int revents) {
 						while (((ret=lirc_code2char(my_lirc_config[i].lirc_config_,code,&c)) == 0) && (c != NULL)) {
 							// Send data event.
 							Handle<Value> emit_argv[3] = {
-								data_symbol,
-								String::New(c, strlen(c)),
-								configFiles_->Get(i)
+								Local<String>::New (isolate, data_symbol),
+								String::NewFromUtf8(isolate, c, String::kNormalString, strlen(c)),
+								Local<Array>::New(isolate, configFiles_)->GetInternalField(i)
 							};
 							TryCatch try_catch;
-							global_cb->Call(Context::GetCurrent()->Global(), 3, emit_argv);
+							local_cb->Call(isolate->GetCurrentContext()->Global(), 3, emit_argv);
 							if (try_catch.HasCaught())
 								FatalException(try_catch);
 						}
@@ -431,42 +477,40 @@ static void io_event (uv_poll_t* req, int status, int revents) {
 			// Send closed event
 			close();
 			Handle<Value> emit_argv[1] = {
-				closed_symbol
+				Local<String>::New (isolate, closed_symbol),
 			};
 			TryCatch try_catch;
-			global_cb->Call(Context::GetCurrent()->Global(), 1, emit_argv);
+			local_cb->Call(isolate->GetCurrentContext()->Global(), 1, emit_argv);
 			if (try_catch.HasCaught())
 				FatalException(try_catch);
 		}
 	}
 }
 
-
-extern "C" {
-  void init (Handle<Object> target) {
-	HandleScope scope;
+void init (Handle<Object> target) {
+	Isolate* isolate = Isolate::GetCurrent();
+	EscapableHandleScope scope(isolate);
 
 	read_watcher_ = NULL;
 
-	emit_symbol = NODE_PSYMBOL("emit");
-	rawdata_symbol = NODE_PSYMBOL("rawdata");
-	data_symbol = NODE_PSYMBOL("data");
-	closed_symbol = NODE_PSYMBOL("closed");
+	emit_symbol.Reset(isolate, String::NewFromUtf8(isolate, "emit"));
+	rawdata_symbol.Reset(isolate, String::NewFromUtf8(isolate, "rawdata"));
+	data_symbol.Reset(isolate, String::NewFromUtf8(isolate, "data"));
+	closed_symbol.Reset(isolate, String::NewFromUtf8(isolate, "closed"));
 
-	isConnected_symbol = NODE_PSYMBOL("isConnected");
-	mode_symbol = NODE_PSYMBOL("mode");
-	configFiles_symbol = NODE_PSYMBOL("configFiles");
+	isConnected_symbol.Reset(isolate, String::NewFromUtf8 (isolate, "isConnected"));
+	mode_symbol.Reset(isolate, String::NewFromUtf8 (isolate, "mode"));
+	configFiles_symbol.Reset(isolate, String::NewFromUtf8 (isolate, "configFiles"));
 
-	target->Set(String::NewSymbol("close"), FunctionTemplate::New(Close)->GetFunction());
-	target->Set(String::NewSymbol("connect"), FunctionTemplate::New(Connect)->GetFunction());
-	target->Set(String::NewSymbol("reConnect"), FunctionTemplate::New(ReConnect)->GetFunction());
-	target->Set(String::NewSymbol("addConfig"), FunctionTemplate::New(AddConfig)->GetFunction());
-	target->Set(String::NewSymbol("clearConfig"), FunctionTemplate::New(ClearConfig)->GetFunction());
+	NODE_SET_METHOD (target, "close", Close);
+	NODE_SET_METHOD (target, "connect", Connect);
+	NODE_SET_METHOD (target, "reConnect", ReConnect);
+	NODE_SET_METHOD (target, "addConfig", AddConfig);
+	NODE_SET_METHOD (target, "clearConfig", ClearConfig);
 
-	target->SetAccessor(isConnected_symbol, IsConnectedGetter);
-	target->SetAccessor(mode_symbol, ModeGetter, ModeSetter);
-	target->SetAccessor(configFiles_symbol, ConfigFilesGetter);
-  }
-
-  NODE_MODULE(lirc_client, init);
+	target->SetAccessor(Local<String>::New(isolate, isConnected_symbol), IsConnectedGetter);
+	target->SetAccessor(Local<String>::New(isolate, mode_symbol), ModeGetter, ModeSetter);
+	target->SetAccessor(Local<String>::New(isolate, configFiles_symbol), ConfigFilesGetter);
 }
+
+NODE_MODULE(lirc_client, init);
